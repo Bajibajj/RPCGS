@@ -1,26 +1,25 @@
+"""Minimal in-process interfaces for the RPCGS decision loop.
+
+The algorithm classes only need a client that can send packages to a server and read its problem, a server
+that knows its registered clients, and a versioned buffer for client uploads and aggregation results.
+Clients run in their own threads (see examples/minimal_demo.py); every request is handled under one lock
+and is followed by an aggregation attempt, so a client waiting for an aggregation result is answered as soon
+as all clients have uploaded the current version.
+"""
 from __future__ import annotations
 
 import functools
+import threading
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any
-
-
-class Actions(Enum):
-    REGISTER = auto()
-    QUIT = auto()
-    PUSH_INIT = auto()
-    PULL_INIT = auto()
-    PUSH_UPDATE = auto()
-    PULL_UPDATE = auto()
 
 
 @dataclass
 class ClientPackage:
     cid: int
-    action: Actions
+    action: Any
     version: int | None = None
     data: Any = None
 
@@ -31,14 +30,9 @@ def record_runtime(name: str | None = None):
         def wrapper(self, *args, **kwargs):
             start = time.time()
             result = func(self, *args, **kwargs)
-            elapsed = time.time() - start
-            label = name or func.__name__
-            if hasattr(self, "record_round_info"):
-                self.record_round_info(label, f"[{elapsed:.2f}s]")
+            self.record_round_info(name or func.__name__, f"[{time.time() - start:.2f}s]")
             return result
-
         return wrapper
-
     return decorate
 
 
@@ -46,105 +40,89 @@ class Client:
     def __init__(self, problem):
         self.problem = problem
         self._server = None
-        self._round_info: dict[str, list[str]] = defaultdict(list)
+        self.rounds_info: dict[str, list[str]] = defaultdict(list)
 
     def bind_server(self, server: "Server"):
         self._server = server
         server.register_client(self.id)
 
-    def request_server(self, package: ClientPackage, repeat: int = 1, interval: float = 0.0, msg: str | None = None):
+    def request_server(self, package, repeat: int = 10, interval: float = 1.0, msg: str | None = None):
         if self._server is None:
-            raise RuntimeError("No server is bound. Call bind_server(server) before requesting server state.")
-        response = None
+            raise RuntimeError("Call bind_server(server) before optimizing.")
         for _ in range(max(1, int(repeat))):
-            response = self._server.handle_request(package)
+            response = self._server.serve(package)
             if self.check_pkg(response):
                 return response
-            if interval > 0:
-                time.sleep(interval)
-        return response
+            time.sleep(interval)
+        return None
 
     def check_pkg(self, package) -> bool:
         return package is not None
 
     def record_round_info(self, name: str, value: Any):
-        self._round_info[name].append(str(value))
+        self.rounds_info[name].append(str(value))
 
-    @property
-    def id(self):
-        return self.problem.id
-
-    @property
-    def dim(self):
-        return self.problem.dim
-
-    @property
-    def obj(self):
-        return self.problem.obj
-
-    @property
-    def fe_init(self):
-        return self.problem.fe_init
-    @property
-    def fe_max(self):
-        return self.problem.fe_max
-
-    @property
-    def lb(self):
-        return self.problem.lb
-
-    @property
-    def ub(self):
-        return self.problem.ub
-
-    @property
-    def solutions(self):
-        return self.problem.solutions
+    id = property(lambda self: self.problem.id)
+    dim = property(lambda self: self.problem.dim)
+    obj = property(lambda self: self.problem.obj)
+    fe_init = property(lambda self: self.problem.fe_init)
+    fe_max = property(lambda self: self.problem.fe_max)
+    lb = property(lambda self: self.problem.lb)
+    ub = property(lambda self: self.problem.ub)
+    solutions = property(lambda self: self.problem.solutions)
 
 
 class Server:
     def __init__(self):
         self._active_clients: set[int] = set()
+        self._lock = threading.Lock()
 
     def register_client(self, client_id: int):
         self._active_clients.add(int(client_id))
 
-    @property
-    def sorted_ids(self):
-        return sorted(self._active_clients)
+    def serve(self, package):
+        """Handle one request, then aggregate if every client has uploaded a new version."""
+        with self._lock:
+            response = self.handle_request(package)
+            self.aggregate()
+            return response
 
-    @property
-    def num_clients(self):
-        return len(self._active_clients)
+    def handle_request(self, package):  # implemented by the algorithm
+        raise NotImplementedError
+
+    def aggregate(self):  # implemented by the algorithm
+        raise NotImplementedError
+
+    sorted_ids = property(lambda self: sorted(self._active_clients))
+    num_clients = property(lambda self: len(self._active_clients))
+
 
 class SyncDataManager:
+    """Versioned buffers of client uploads (source) and aggregation results."""
+
     def __init__(self):
-        self._src: dict[int, dict[int, ClientPackage]] = defaultdict(dict)
-        self._res: dict[int, dict[int, Any]] = defaultdict(dict)
+        self._source: dict[int, dict[int, Any]] = defaultdict(dict)
+        self._result: dict[int, dict[int, Any]] = defaultdict(dict)
 
-    def update_src(self, cid: int, version: int, package: ClientPackage):
-        self._src[int(cid)][int(version)] = package
-
-    def get_src(self, cid: int, version: int):
-        return self._src[int(cid)][int(version)]
+    def update_src(self, cid: int, version: int, data: Any):
+        self._source[int(cid)][int(version)] = data
 
     def update_res(self, cid: int, version: int, data: Any):
-        self._res[int(cid)][int(version)] = data
+        self._result[int(cid)][int(version)] = data
+
+    def get_src(self, cid: int, version: int):
+        return self._source.get(int(cid), {}).get(int(version))
 
     def get_res(self, cid: int, version: int):
-        return self._res.get(int(cid), {}).get(int(version))
+        return self._result.get(int(cid), {}).get(int(version))
 
     @property
-    def num_clients(self):
-        return len(self._src)
-
-    @property
-    def available_src_ver(self):
-        if not self._src:
+    def available_src_ver(self) -> int:
+        """Latest version uploaded by every client (-1 if a client has uploaded nothing)."""
+        if not self._source:
             return -1
-        counts = Counter()
-        for by_version in self._src.values():
-            counts.update(by_version.keys())
-        required = len(self._src)
-        ready = [version for version, count in counts.items() if count == required]
-        return max(ready) if ready else -1
+        return min(max(data) for data in self._source.values())
+
+    @property
+    def num_clients(self) -> int:
+        return len(self._source)
